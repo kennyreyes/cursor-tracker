@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Cursor Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f5f5f5;
+    --ink: #1a1a1a;
+    --mute: #7c7c7c;
+    --amber: #e39b12;
+    --badge: #111111;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--mute);
+    font-family: "IBM Plex Mono", ui-monospace, "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+    overflow: hidden;
+    user-select: none;
+    cursor: none;
+    touch-action: none;
+  }
+
+  #field {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+    pointer-events: none;
+    display: block;
+  }
+
+  #hud {
+    position: fixed;
+    left: 0;
+    top: 0;
+    z-index: 2;
+    pointer-events: none;
+    white-space: nowrap;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 156px;
+    background: var(--badge);
+    color: #fff;
+    font-weight: 600;
+    font-size: 13px;
+    letter-spacing: 0.065em;
+    line-height: 1;
+    padding: 6px 10px 6px 7px;
+  }
+
+  .swatch {
+    width: 9px;
+    height: 9px;
+    background: var(--amber);
+    flex: none;
+  }
+
+  .coords {
+    display: flex;
+    gap: 18px;
+    margin: 8px 0 0 24px;
+    font-size: 13px;
+    font-weight: 400;
+    letter-spacing: 0.07em;
+    color: var(--mute);
+  }
+
+  .metric-row {
+    display: flex;
+    align-items: center;
+    margin: 5px 0 0 24px;
+    font-size: 13px;
+    font-weight: 400;
+    letter-spacing: 0.055em;
+    color: var(--mute);
+  }
+
+  .metrics {
+    display: flex;
+    gap: 0.72em;
+  }
+
+  #hud.face-left {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+  }
+
+  #hud.face-left .coords,
+  #hud.face-left .metric-row {
+    margin-left: 0;
+    margin-right: 24px;
+  }
+</style>
+</head>
+<body>
+<svg id="field" xmlns="http://www.w3.org/2000/svg"></svg>
+<div id="hud">
+  <div class="badge">
+    <i class="swatch" aria-hidden="true"></i>
+    <span id="state">STILL+0.00</span>
+  </div>
+  <div class="coords">
+    <span id="xv">X.000</span>
+    <span id="yv">Y.000</span>
+  </div>
+  <div class="metric-row">
+    <div class="metrics" id="metrics">
+      <span id="mL">L.00</span>
+      <span id="mC">C.00</span>
+      <span id="mA">A.00</span>
+      <span id="mF">F.00</span>
+      <span id="mI">I.00</span>
+    </div>
+  </div>
+</div>
+<script>
+(() => {
+  const BG = "#f5f5f5";
+  const BOX_HW = 15;
+  const BOX_HH = 15;
+  const BOX_ARM = 5;
+  const field = document.getElementById("field");
+  const hud = document.getElementById("hud");
+  const el = {
+    state: document.getElementById("state"),
+    x: document.getElementById("xv"),
+    y: document.getElementById("yv"),
+    L: document.getElementById("mL"),
+    C: document.getElementById("mC"),
+    A: document.getElementById("mA"),
+    F: document.getElementById("mF"),
+    I: document.getElementById("mI"),
+  };
+
+  const WINDOW_MS = 520;
+  const IDLE_MS = 110;
+  const TRAIL_GAP = 46;
+  const TRAIL_MAX = 5;
+
+  let cx = window.innerWidth * 0.4;
+  let cy = window.innerHeight * 0.5;
+  let moved = false;
+  let lastSampleAt = 0;
+
+  const samples = [];
+  const trail = [];
+
+  let smooth = null;
+  let shownState = "STILL";
+  let pendingState = "STILL";
+  let pendingAt = 0;
+
+  function clamp(n, a, b) {
+    return Math.max(a, Math.min(b, n));
+  }
+
+  function fmt(n, digits) {
+    const v = clamp(n, 0, 1);
+    let s = v.toFixed(digits);
+    if (s.startsWith("0")) s = s.slice(1);
+    return s;
+  }
+
+  function signed(n) {
+    const v = clamp(n, -0.99, 0.99);
+    const s = v.toFixed(2);
+    return v >= 0 ? "+" + s : s;
+  }
+
+  function onMove(e) {
+    if (e.clientX == null || e.clientY == null) return;
+    cx = e.clientX;
+    cy = e.clientY;
+    moved = true;
+    const t = performance.now();
+    if (t - lastSampleAt < 6) return;
+    lastSampleAt = t;
+    const prev = samples[samples.length - 1];
+    if (prev && Math.hypot(cx - prev.x, cy - prev.y) < 0.4) return;
+    samples.push({ x: cx, y: cy, t });
+    const cutoff = t - WINDOW_MS;
+    while (samples.length && samples[0].t < cutoff) samples.shift();
+    const last = trail[0];
+    if (!last || Math.hypot(cx - last.x, cy - last.y) >= TRAIL_GAP) {
+      trail.unshift({ x: cx, y: cy });
+      if (trail.length > TRAIL_MAX) trail.pop();
+    }
+  }
+
+  window.addEventListener("pointermove", onMove, { passive: true });
+  window.addEventListener("pointerrawupdate", onMove, { passive: true });
+
+  window.addEventListener("resize", () => {
+    if (!moved) {
+      cx = window.innerWidth * 0.4;
+      cy = window.innerHeight * 0.5;
+    }
+  });
+
+  // L linearity, C curvature, A acceleration, F flutter, I intensity.
+  function analyze(now) {
+    const recent = samples.filter((s) => now - s.t <= WINDOW_MS);
+    const idle = !recent.length || now - recent[recent.length - 1].t > IDLE_MS;
+    if (recent.length < 2 || idle) {
+      return { L: 0, C: 0, A: 0, F: 0, I: 0, path: 0, decel: false };
+    }
+
+    let path = 0;
+    let turn = 0;
+    let reversals = 0;
+    let turns = 0;
+    let prevAng = null;
+    const speeds = [];
+
+    for (let i = 1; i < recent.length; i++) {
+      const a = recent[i - 1];
+      const b = recent[i];
+      const dt = (b.t - a.t) / 1000;
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dist = Math.hypot(dx, dy);
+      path += dist;
+      if (dt > 0.001) speeds.push(dist / dt);
+      if (dist > 1.25) {
+        const ang = Math.atan2(dy, dx);
+        if (prevAng !== null) {
+          let d = ang - prevAng;
+          while (d > Math.PI) d -= Math.PI * 2;
+          while (d < -Math.PI) d += Math.PI * 2;
+          const ad = Math.abs(d);
+          turn += ad;
+          turns++;
+          if (ad > 2.05) reversals++;
+        }
+        prevAng = ang;
+      }
+    }
+
+    const last = recent[recent.length - 1];
+    const first = recent[0];
+    const disp = Math.hypot(last.x - first.x, last.y - first.y);
+    const span = Math.max((last.t - first.t) / 1000, 0.05);
+    const L = path < 1 ? 1 : disp / path;
+    const C = turn / Math.PI;
+    const avg = speeds.length ? speeds.reduce((s, v) => s + v, 0) / speeds.length : 0;
+    const I = avg / 1500;
+    let accel = 0;
+    let decel = false;
+    if (speeds.length >= 4) {
+      const head = (speeds[0] + speeds[1]) / 2;
+      const tail = (speeds[speeds.length - 2] + speeds[speeds.length - 1]) / 2;
+      accel = Math.abs(tail - head) / span;
+      decel = head > 260 && tail < head * 0.48;
+    }
+    const F = (reversals / Math.max(turns, 1)) * 1.7;
+
+    return { L, C, A: accel / 4800, F, I, path, decel };
+  }
+
+  function classify(raw) {
+    const { L, C, F, I, path, decel } = raw;
+    if (path < 12 || I < 0.045) return "STILL";
+    if (path > 42 && L < 0.46) return "CONFUSED";
+    if (decel && L > 0.6 && I < 0.42) return "AIM";
+    if (L > 0.82 && I > 0.1 && F < 0.45) return "GLIDE";
+    if (I < 0.13) return "HOVER";
+    if (C > 0.18 && L < 0.84) return "SWEEP";
+    return "TRACK";
+  }
+
+  function commitState(next, now) {
+    if (next === shownState) {
+      pendingState = next;
+      return shownState;
+    }
+    if (next !== pendingState) {
+      pendingState = next;
+      pendingAt = now;
+      return shownState;
+    }
+    if (now - pendingAt > 130) shownState = next;
+    return shownState;
+  }
+
+  function ease(raw) {
+    const keys = ["L", "C", "A", "F", "I"];
+    if (!smooth) {
+      smooth = { L: raw.L, C: raw.C, A: raw.A, F: raw.F, I: raw.I };
+      return smooth;
+    }
+    const k = raw.I < 0.02 && raw.path < 1 ? 0.08 : 0.22;
+    for (const key of keys) smooth[key] += (raw[key] - smooth[key]) * k;
+    return smooth;
+  }
+
+  function sq(x, y, size, opacity) {
+    const h = size / 2;
+    const X = Math.round(x - h) + 0.5;
+    const Y = Math.round(y - h) + 0.5;
+    return `<rect x="${X}" y="${Y}" width="${size}" height="${size}" fill="${BG}" stroke="#1c1c1c" stroke-width="1.15" opacity="${opacity.toFixed(3)}"/>`;
+  }
+
+  function seg(x1, y1, x2, y2, opacity, color, width = 1) {
+    return `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="${color}" stroke-width="${width}" opacity="${opacity.toFixed(3)}" stroke-linecap="square"/>`;
+  }
+
+  function bracket(x, y, hDir, vDir, arm) {
+    const X = x + 0.5;
+    const Y = y + 0.5;
+    const hx = x + hDir * arm + 0.5;
+    const vy = y + vDir * arm + 0.5;
+    return `<path d="M ${hx} ${Y} H ${X} V ${vy}" fill="none" stroke="#1a1a1a" stroke-width="1.25" stroke-linecap="square"/>`;
+  }
+
+  function boxGeometry() {
+    return {
+      l: Math.round(cx - BOX_HW),
+      r: Math.round(cx + BOX_HW),
+      t: Math.round(cy - BOX_HH),
+      b: Math.round(cy + BOX_HH),
+    };
+  }
+
+  // First point where the segment from (x, y) toward the cursor meets the box.
+  // Points already inside return null so nothing is drawn across the interior.
+  function meetBox(x, y, box) {
+    const dx = cx - x;
+    const dy = cy - y;
+    let tHit = Infinity;
+    const take = (t, onEdge) => {
+      if (t >= 0 && t < 1 && t < tHit && onEdge) tHit = t;
+    };
+    if (dx !== 0) {
+      for (const edge of [box.l, box.r]) {
+        const t = (edge - x) / dx;
+        const iy = y + t * dy;
+        take(t, iy >= box.t && iy <= box.b);
+      }
+    }
+    if (dy !== 0) {
+      for (const edge of [box.t, box.b]) {
+        const t = (edge - y) / dy;
+        const ix = x + t * dx;
+        take(t, ix >= box.l && ix <= box.r);
+      }
+    }
+    if (tHit === Infinity) return null;
+    return { x: x + tHit * dx, y: y + tHit * dy };
+  }
+
+  function tryAnchor(box, side, vert, lead, rise, metrics) {
+    const { bL, bT, bW, bH, hudW, hudH, margin, vw, vh } = metrics;
+    const x1 = side === "right" ? box.r : box.l;
+    const y1 = vert === "up" ? box.t : box.b;
+    const x2 = x1 + (side === "right" ? lead : -lead);
+    const y2 = y1 + (vert === "up" ? -rise : rise);
+    const left = side === "right" ? x2 - bL : x2 - (bL + bW);
+    const top = y2 - (bT + bH / 2);
+    const fits =
+      left >= margin &&
+      top >= margin &&
+      left + hudW <= vw - margin &&
+      top + hudH <= vh - margin;
+    return fits ? { left, top, x1, y1, x2, y2 } : null;
+  }
+
+  function layoutHud(box) {
+    const badge = document.querySelector(".badge");
+    const order = [
+      ["right", "up"],
+      ["left", "up"],
+      ["right", "down"],
+      ["left", "down"],
+    ];
+    for (const [side, vert] of order) {
+      hud.classList.toggle("face-left", side === "left");
+      const metrics = {
+        bL: badge.offsetLeft,
+        bT: badge.offsetTop,
+        bW: badge.offsetWidth,
+        bH: badge.offsetHeight,
+        hudW: hud.offsetWidth,
+        hudH: hud.offsetHeight,
+        margin: 14,
+        vw: window.innerWidth,
+        vh: window.innerHeight,
+      };
+      for (const lead of [36, 28, 20, 14]) {
+        for (const rise of [16, 8, 0]) {
+          const hit = tryAnchor(box, side, vert, lead, rise, metrics);
+          if (hit) return hit;
+        }
+      }
+    }
+    hud.classList.remove("face-left");
+    return { left: 14, top: 14, x1: box.r, y1: box.t, x2: box.r + 14, y2: box.t };
+  }
+
+  function arrow(x, y) {
+    return `<g transform="translate(${x.toFixed(2)} ${y.toFixed(2)}) scale(1.22)" style="paint-order: stroke fill">
+      <path d="M0 0 L0 16.7 L4.55 12.55 L7.85 20.45 L10.75 19 L7.35 11.15 L13.45 11.15 Z"
+        fill="#111" stroke="#fff" stroke-width="1.2" stroke-linejoin="round"
+        vector-effect="non-scaling-stroke"/>
+    </g>`;
+  }
+
+  function paintField(box, link) {
+    const parts = [];
+    const px = Math.round(cx) + 0.5;
+    parts.push(seg(px, box.b, px, box.b + 72, 0.9, "#d3d3d3"));
+
+    for (let i = trail.length - 1; i >= 0; i--) {
+      const p = trail[i];
+      const k = trail.length === 1 ? 0 : i / (trail.length - 1);
+      const edge = meetBox(p.x, p.y, box);
+      if (edge) parts.push(seg(p.x, p.y, edge.x, edge.y, 0.5 - k * 0.22, "#b9b9b9"));
+    }
+
+    parts.push(bracket(box.l, box.t, 1, 1, BOX_ARM));
+    parts.push(bracket(box.r, box.t, -1, 1, BOX_ARM));
+    parts.push(bracket(box.l, box.b, 1, -1, BOX_ARM));
+    parts.push(bracket(box.r, box.b, -1, -1, BOX_ARM));
+
+    const into = link.x2 >= link.x1 ? 1 : -1;
+    parts.push(seg(link.x1 + 0.5, link.y1 + 0.5, link.x2 + into, link.y2, 1, "#1a1a1a", 1.25));
+
+    for (let i = trail.length - 1; i >= 0; i--) {
+      const p = trail[i];
+      const k = trail.length === 1 ? 0 : i / (trail.length - 1);
+      const size = 8 - k * 2.4;
+      parts.push(sq(p.x, p.y, size, 1 - k * 0.45));
+      if (i === 0) {
+        const ang = Math.atan2(p.y - cy, p.x - cx);
+        parts.push(seg(
+          p.x + Math.cos(ang) * 5,
+          p.y + Math.sin(ang) * 5,
+          p.x + Math.cos(ang) * 12,
+          p.y + Math.sin(ang) * 12,
+          0.85,
+          "#1c1c1c"
+        ));
+      }
+    }
+
+    parts.push(sq(cx + 18, cy + 7, 6.5, 1));
+    parts.push(arrow(cx, cy));
+    field.innerHTML = parts.join("");
+  }
+
+  function frame(now) {
+    const raw = analyze(now);
+    const view = ease(raw);
+    const state = commitState(classify(raw), now);
+    const score = state === "STILL" ? 0 : view.L * 1.45 - 0.54;
+    const nx = window.innerWidth ? cx / window.innerWidth : 0;
+    const ny = window.innerHeight ? cy / window.innerHeight : 0;
+
+    el.state.textContent = state + signed(score);
+    el.x.textContent = "X" + fmt(nx, 3);
+    el.y.textContent = "Y" + fmt(ny, 3);
+    el.L.textContent = "L" + fmt(view.L, 2);
+    el.C.textContent = "C" + fmt(view.C, 2);
+    el.A.textContent = "A" + fmt(view.A, 2);
+    el.F.textContent = "F" + fmt(view.F, 2);
+    el.I.textContent = "I" + fmt(view.I, 2);
+
+    const box = boxGeometry();
+    const link = layoutHud(box);
+    paintField(box, link);
+    hud.style.transform = `translate(${Math.round(link.left)}px, ${Math.round(link.top)}px)`;
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
